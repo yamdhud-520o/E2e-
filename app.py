@@ -9,6 +9,7 @@ import time
 import json
 import secrets
 import hashlib
+import requests
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 import logging
@@ -48,10 +49,11 @@ def init_db():
                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                   FOREIGN KEY (user_id) REFERENCES users (id))''')
     
-    # Jobs table
+    # Jobs table with UID support
     c.execute('''CREATE TABLE IF NOT EXISTS jobs
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   user_id INTEGER,
+                  target_uid TEXT,
                   target_name TEXT,
                   delay_seconds REAL,
                   message_text TEXT,
@@ -68,6 +70,19 @@ def init_db():
                   log_type TEXT,
                   message TEXT,
                   timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  FOREIGN KEY (job_id) REFERENCES jobs (id))''')
+    
+    # Message history table
+    c.execute('''CREATE TABLE IF NOT EXISTS message_history
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  job_id INTEGER,
+                  target_uid TEXT,
+                  target_name TEXT,
+                  message TEXT,
+                  cookie_used TEXT,
+                  status TEXT,
+                  response TEXT,
+                  sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                   FOREIGN KEY (job_id) REFERENCES jobs (id))''')
     
     conn.commit()
@@ -91,6 +106,200 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+# ==================== FACEBOOK MESSENGER CLASS ====================
+class FacebookMessenger:
+    """Handle Facebook message sending via Graph API"""
+    
+    @staticmethod
+    def get_user_info_from_uid(cookie, uid):
+        """Get user info from UID using Facebook Graph API"""
+        try:
+            headers = {
+                'Cookie': cookie,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json',
+                'Accept-Language': 'en-US,en;q=0.9',
+            }
+            
+            # Try to get user info
+            url = f'https://graph.facebook.com/v18.0/{uid}'
+            params = {
+                'fields': 'id,name,first_name,last_name',
+                'access_token': FacebookMessenger.extract_token_from_cookie(cookie)
+            }
+            
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                return {
+                    'success': True,
+                    'uid': uid,
+                    'name': data.get('name', 'Unknown'),
+                    'first_name': data.get('first_name', ''),
+                    'last_name': data.get('last_name', '')
+                }
+            else:
+                return {
+                    'success': False,
+                    'error': f'API Error: {response.status_code}'
+                }
+                
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    @staticmethod
+    def extract_token_from_cookie(cookie):
+        """Extract access token from cookie string"""
+        try:
+            # Try to find EAA token in cookie
+            if 'EAA' in cookie:
+                token_start = cookie.index('EAA')
+                token = cookie[token_start:].split(';')[0].split('&')[0]
+                return token
+            
+            # Try to extract from c_user and xs
+            cookies_dict = {}
+            for item in cookie.split(';'):
+                if '=' in item:
+                    key, value = item.strip().split('=', 1)
+                    cookies_dict[key.strip()] = value.strip()
+            
+            if 'c_user' in cookies_dict and 'xs' in cookies_dict:
+                return f"{cookies_dict['c_user']}|{cookies_dict['xs']}"
+            
+            return None
+            
+        except:
+            return None
+    
+    @staticmethod
+    def send_message_to_uid(cookie, target_uid, message):
+        """Send message to specific UID using Facebook Graph API"""
+        try:
+            headers = {
+                'Cookie': cookie,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+            }
+            
+            # Facebook Graph API endpoint for sending messages
+            url = f'https://graph.facebook.com/v18.0/me/messages'
+            
+            # Prepare message data
+            data = {
+                'recipient': {'id': target_uid},
+                'message': {'text': message},
+                'messaging_type': 'RESPONSE',
+                'access_token': FacebookMessenger.extract_token_from_cookie(cookie)
+            }
+            
+            response = requests.post(url, headers=headers, json=data, timeout=15)
+            
+            if response.status_code == 200:
+                result = response.json()
+                return {
+                    'success': True,
+                    'message_id': result.get('message_id', ''),
+                    'recipient_id': result.get('recipient_id', target_uid)
+                }
+            elif response.status_code == 400:
+                error_data = response.json()
+                return {
+                    'success': False,
+                    'error': error_data.get('error', {}).get('message', 'Bad Request'),
+                    'code': error_data.get('error', {}).get('code', 400)
+                }
+            else:
+                return {
+                    'success': False,
+                    'error': f'HTTP {response.status_code}',
+                    'response': response.text[:200]
+                }
+                
+        except requests.exceptions.Timeout:
+            return {
+                'success': False,
+                'error': 'Request timeout - check internet connection'
+            }
+        except requests.exceptions.ConnectionError:
+            return {
+                'success': False,
+                'error': 'Connection failed - check internet'
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    @staticmethod
+    def validate_uid(cookie, uid):
+        """Validate if UID exists and is reachable"""
+        user_info = FacebookMessenger.get_user_info_from_uid(cookie, uid)
+        return user_info
+    
+    @staticmethod
+    def batch_send(cookies_list, target_uid, target_name, message, delay, job_id, log_callback):
+        """Send messages using multiple cookies to single UID"""
+        total = len(cookies_list)
+        success = 0
+        failed = 0
+        
+        for index, cookie in enumerate(cookies_list, 1):
+            log_callback(job_id, 'info', f'📨 Using cookie {index}/{total}')
+            
+            # Send message
+            result = FacebookMessenger.send_message_to_uid(cookie.strip(), target_uid, message)
+            
+            if result['success']:
+                success += 1
+                log_callback(job_id, 'success', 
+                           f'✅ Message sent to UID {target_uid} ({target_name})')
+                
+                # Save to history
+                conn = sqlite3.connect(DB_NAME)
+                conn.execute('''INSERT INTO message_history 
+                              (job_id, target_uid, target_name, message, cookie_used, status, response)
+                              VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                           (job_id, target_uid, target_name, message, 
+                            cookie[:50] + '...', 'sent', str(result.get('message_id', ''))))
+                conn.commit()
+                conn.close()
+            else:
+                failed += 1
+                error_msg = result.get('error', 'Unknown error')
+                log_callback(job_id, 'error', 
+                           f'❌ Failed: {error_msg[:100]}')
+                
+                # Save failed attempt
+                conn = sqlite3.connect(DB_NAME)
+                conn.execute('''INSERT INTO message_history 
+                              (job_id, target_uid, target_name, message, cookie_used, status, response)
+                              VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                           (job_id, target_uid, target_name, message,
+                            cookie[:50] + '...', 'failed', error_msg[:200]))
+                conn.commit()
+                conn.close()
+            
+            # Update counters
+            conn = sqlite3.connect(DB_NAME)
+            conn.execute('UPDATE jobs SET total_sent=?, total_failed=? WHERE id=?',
+                       (success, failed, job_id))
+            conn.commit()
+            conn.close()
+            
+            # Apply delay between messages
+            if index < total:
+                log_callback(job_id, 'info', f'⏳ Waiting {delay}s...')
+                time.sleep(delay)
+        
+        return success, failed
+
 # ==================== BACKGROUND JOB PROCESSOR ====================
 class JobProcessor:
     def __init__(self):
@@ -113,102 +322,112 @@ class JobProcessor:
     
     def execute_job(self, job_id):
         job = active_jobs[job_id]
-        self.add_log(job_id, 'info', f'🚀 Job started - Target: {job["target_name"]}')
+        self.add_log(job_id, 'info', f'🚀 Job started for UID: {job["target_uid"]}')
+        self.add_log(job_id, 'info', f'👤 Target: {job["target_name"]}')
+        self.add_log(job_id, 'info', f'💬 Message: {job["message_text"][:50]}...')
         
-        # Get credentials
+        # Get credentials from database
         conn = sqlite3.connect(DB_NAME)
         creds = conn.execute('SELECT value FROM credentials WHERE user_id = ?', 
                             (job['user_id'],)).fetchall()
         conn.close()
         
         if not creds:
-            self.add_log(job_id, 'error', '❌ No credentials found!')
+            self.add_log(job_id, 'error', '❌ No cookies/tokens found! Add credentials first.')
             self.update_job_status(job_id, 'failed')
             return
         
         credentials = [c[0] for c in creds]
-        total = len(credentials)
-        success = 0
-        failed = 0
+        total_cookies = len(credentials)
         
-        self.add_log(job_id, 'info', f'📊 Total credentials loaded: {total}')
+        self.add_log(job_id, 'info', f'📊 Total cookies loaded: {total_cookies}')
+        self.add_log(job_id, 'info', f'🎯 Target UID: {job["target_uid"]}')
+        self.add_log(job_id, 'info', f'⏱️ Delay: {job["delay_seconds"]} seconds')
         
+        # Infinite loop for 24/7 running
+        cycle = 1
         while job_id in active_jobs and active_jobs[job_id]['status'] == 'running':
-            for index, cred in enumerate(credentials, 1):
-                if job_id not in active_jobs or active_jobs[job_id]['status'] != 'running':
-                    break
-                
-                try:
-                    self.add_log(job_id, 'info', f'📨 Processing {index}/{total}')
-                    
-                    # Simulate message sending
-                    time.sleep(0.5)
-                    
-                    # Random success/failure for demo
-                    import random
-                    if random.random() > 0.1:  # 90% success rate
-                        success += 1
-                        self.add_log(job_id, 'success', 
-                                   f'✅ Message {index} sent to {job["target_name"]}')
-                    else:
-                        failed += 1
-                        self.add_log(job_id, 'error', 
-                                   f'❌ Message {index} failed')
-                    
-                    # Update counters
-                    conn = sqlite3.connect(DB_NAME)
-                    conn.execute('UPDATE jobs SET total_sent=?, total_failed=? WHERE id=?',
-                               (success, failed, job_id))
-                    conn.commit()
-                    conn.close()
-                    
-                    # Apply delay
-                    if index < total:
-                        time.sleep(job['delay_seconds'])
-                        
-                except Exception as e:
-                    failed += 1
-                    self.add_log(job_id, 'error', f'Error: {str(e)}')
+            self.add_log(job_id, 'info', f'🔄 CYCLE {cycle} STARTED')
+            self.add_log(job_id, 'info', f'📤 Sending {total_cookies} messages per cycle')
             
-            # Cycle complete
+            # Send messages using all cookies
+            success, failed = FacebookMessenger.batch_send(
+                credentials,
+                job['target_uid'],
+                job['target_name'],
+                job['message_text'],
+                job['delay_seconds'],
+                job_id,
+                self.add_log
+            )
+            
+            self.add_log(job_id, 'success', 
+                       f'✅ Cycle {cycle} Complete: {success} sent, {failed} failed')
+            
+            # Update overall counters
+            conn = sqlite3.connect(DB_NAME)
+            conn.execute('UPDATE jobs SET total_sent = total_sent + ?, total_failed = total_failed + ? WHERE id = ?',
+                       (success, failed, job_id))
+            conn.commit()
+            conn.close()
+            
+            # If all failed, maybe cookies expired
+            if failed == total_cookies:
+                self.add_log(job_id, 'warning', 
+                           '⚠️ All messages failed! Cookies might be expired.')
+            
+            # Wait before next cycle
             if job_id in active_jobs and active_jobs[job_id]['status'] == 'running':
-                self.add_log(job_id, 'info', '🔄 Cycle complete. Restarting...')
-                time.sleep(2)
+                cycle += 1
+                self.add_log(job_id, 'info', 
+                           f'⏰ Next cycle in {job["delay_seconds"] * 2} seconds...')
+                time.sleep(job['delay_seconds'] * 2)
         
-        # Job stopped
-        final_status = 'completed' if failed == 0 else 'completed_with_errors'
+        # Job finished
+        final_status = 'completed' if job.get('_stopped_by_user') else 'stopped'
         self.update_job_status(job_id, final_status)
-        self.add_log(job_id, 'info', 
-                    f'📈 Final: {success} success, {failed} failed out of {total}')
+        self.add_log(job_id, 'info', f'🏁 Job {final_status}')
     
     def add_log(self, job_id, log_type, message):
-        """Add log to database and memory"""
-        conn = sqlite3.connect(DB_NAME)
-        conn.execute('INSERT INTO logs (job_id, log_type, message) VALUES (?, ?, ?)',
-                    (job_id, log_type, message))
-        conn.commit()
-        conn.close()
+        """Add log entry"""
+        timestamp = datetime.now().strftime('%H:%M:%S')
         
+        # Save to database
+        try:
+            conn = sqlite3.connect(DB_NAME)
+            conn.execute('INSERT INTO logs (job_id, log_type, message) VALUES (?, ?, ?)',
+                        (job_id, log_type, message))
+            conn.commit()
+            conn.close()
+        except:
+            pass
+        
+        # Save to memory for real-time console
         if job_id not in console_logs:
             console_logs[job_id] = []
         console_logs[job_id].append({
-            'timestamp': datetime.now().strftime('%H:%M:%S'),
+            'timestamp': timestamp,
             'type': log_type,
             'message': message
         })
         
-        # Keep only last 200 logs in memory
-        if len(console_logs[job_id]) > 200:
-            console_logs[job_id] = console_logs[job_id][-200:]
+        # Keep only last 500 logs in memory
+        if len(console_logs[job_id]) > 500:
+            console_logs[job_id] = console_logs[job_id][-500:]
+        
+        logger.info(f"[Job {job_id}] {message}")
     
     def update_job_status(self, job_id, status):
-        """Update job status"""
-        conn = sqlite3.connect(DB_NAME)
-        conn.execute('UPDATE jobs SET status=? WHERE id=?', (status, job_id))
-        conn.commit()
-        conn.close()
+        """Update job status in database"""
+        try:
+            conn = sqlite3.connect(DB_NAME)
+            conn.execute('UPDATE jobs SET status = ? WHERE id = ?', (status, job_id))
+            conn.commit()
+            conn.close()
+        except:
+            pass
 
-# Start job processor
+# Start background processor
 job_processor = JobProcessor()
 
 # ==================== HTML TEMPLATE ====================
@@ -318,7 +537,7 @@ HTML_TEMPLATE = '''
             margin-bottom: 8px;
         }
         
-        .form-control, .form-select {
+        .form-control {
             border: 2px solid #E3F2FD;
             border-radius: 12px;
             padding: 12px;
@@ -360,9 +579,7 @@ HTML_TEMPLATE = '''
             50% { box-shadow: 0 0 40px rgba(244,67,54,0.8); }
         }
         
-        .btn-danger:hover {
-            transform: scale(1.05);
-        }
+        .btn-danger:hover { transform: scale(1.05); }
         
         .btn-warning {
             background: linear-gradient(135deg, #F57C00, #FF9800);
@@ -376,6 +593,11 @@ HTML_TEMPLATE = '''
         }
         
         .btn-warning:hover { transform: scale(1.05); }
+        
+        .btn-success {
+            background: linear-gradient(135deg, #388E3C, #4CAF50);
+            border: none;
+        }
         
         .status-badge {
             display: inline-block;
@@ -457,6 +679,15 @@ HTML_TEMPLATE = '''
         
         .upload-zone i { font-size: 3em; color: var(--primary); }
         
+        .uid-badge {
+            background: linear-gradient(135deg, #FF6F00, #FF8F00);
+            color: white;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            font-weight: 600;
+        }
+        
         .footer {
             background: linear-gradient(135deg, #0D47A1, #1565C0);
             color: white;
@@ -487,7 +718,7 @@ HTML_TEMPLATE = '''
     <!-- Header -->
     <div class="header">
         <h1>🔐 End to End Offline Tool by Virat Rajput</h1>
-        <h3>🚀 Offline Tool Non-Stop E2E Tool Advanced System</h3>
+        <h3>🚀 Offline Tool Non-Stop E2E UID Messenger</h3>
     </div>
     
     <div class="container">
@@ -568,17 +799,41 @@ HTML_TEMPLATE = '''
             
             <!-- E2E Info -->
             <div class="e2e-info">
-                <h4><i class="fas fa-shield-alt"></i> What is End-to-End Encryption (E2EE)?</h4>
+                <h4><i class="fas fa-shield-alt"></i> End-to-End Encryption (E2EE) + UID Messaging</h4>
                 <p style="line-height: 1.8; margin-top: 15px;">
-                    <strong>End-to-End Encryption (E2EE)</strong> is a secure communication method where only the sender and receiver can read messages. Data is encrypted on sender's device and only decrypted on receiver's device. No third party - not even the service provider - can access the content.
+                    <strong>E2EE</strong> ensures only sender and receiver can read messages. With <strong>UID-based messaging</strong>, you can target specific Facebook users using their unique User ID. Messages are encrypted end-to-end and sent directly to the recipient's inbox.
                 </p>
                 <p style="line-height: 1.8;">
-                    <strong>How it works:</strong>
-                    <br>• Message encrypted before leaving your device
-                    <br>• Only recipient has decryption key
-                    <br>• Prevents surveillance and interception
-                    <br>• Ensures complete privacy in digital communication
+                    <strong>UID Messaging Features:</strong>
+                    <br>• Send messages to specific Facebook User ID
+                    <br>• Multiple cookies support for continuous sending
+                    <br>• 24/7 non-stop operation
+                    <br>• Automatic retry on failure
+                    <br>• Real-time delivery tracking
                 </p>
+            </div>
+            
+            <!-- UID Lookup -->
+            <div class="card">
+                <div class="card-header">
+                    <i class="fas fa-search"></i> UID Lookup & Validation
+                </div>
+                <div class="card-body">
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label"><i class="fas fa-id-card"></i> Facebook UID</label>
+                            <input type="text" class="form-control" id="lookup-uid" placeholder="Enter Facebook User ID (e.g., 1000xxxxxxxxx)">
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label"><i class="fas fa-cookie"></i> Cookie for Validation</label>
+                            <input type="text" class="form-control" id="lookup-cookie" placeholder="Paste a valid cookie">
+                        </div>
+                    </div>
+                    <button class="btn btn-success" onclick="validateUID()">
+                        <i class="fas fa-check-circle"></i> Validate UID
+                    </button>
+                    <div id="uid-result" class="mt-3" style="display:none;"></div>
+                </div>
             </div>
             
             <!-- Credentials & Upload -->
@@ -589,7 +844,7 @@ HTML_TEMPLATE = '''
                         <div class="card-body">
                             <div class="mb-3">
                                 <label class="form-label">Cookies (One per line)</label>
-                                <textarea class="form-control" id="cookies-input" rows="3" placeholder="cookie1=value1;..."></textarea>
+                                <textarea class="form-control" id="cookies-input" rows="3" placeholder="cookie1=value1; c_user=...; xs=..."></textarea>
                             </div>
                             <div class="mb-3">
                                 <label class="form-label">Tokens (One per line)</label>
@@ -608,7 +863,7 @@ HTML_TEMPLATE = '''
                         <div class="card-body">
                             <div class="upload-zone mb-3" onclick="document.getElementById('cred-file').click()">
                                 <i class="fas fa-cloud-upload-alt"></i>
-                                <p>Upload Cookies/Tokens File (.txt)</p>
+                                <p>Upload Cookies File (.txt)</p>
                                 <input type="file" id="cred-file" accept=".txt" style="display:none;" onchange="uploadCredFile(this)">
                             </div>
                             <div class="upload-zone" onclick="document.getElementById('msg-file').click()">
@@ -621,30 +876,36 @@ HTML_TEMPLATE = '''
                 </div>
             </div>
             
-            <!-- Job Config -->
+            <!-- Job Config with UID -->
             <div class="card">
                 <div class="card-header">
-                    <i class="fas fa-cogs"></i> Job Configuration
-                    <span id="job-id-display" class="badge bg-info" style="display:none;">Job: -</span>
+                    <i class="fas fa-cogs"></i> UID Message Configuration
+                    <span id="job-id-display" class="uid-badge" style="display:none;">Job: -</span>
                 </div>
                 <div class="card-body">
                     <div class="row">
-                        <div class="col-md-6 mb-3">
-                            <label class="form-label"><i class="fas fa-user-slash"></i> Target Name (Hater's Name)</label>
-                            <input type="text" class="form-control" id="target-name" placeholder="Enter target name">
+                        <div class="col-md-4 mb-3">
+                            <label class="form-label"><i class="fas fa-fingerprint"></i> Target UID (Required)</label>
+                            <input type="text" class="form-control" id="target-uid" placeholder="Facebook User ID">
+                            <small class="text-muted">Example: 1000123456789</small>
                         </div>
-                        <div class="col-md-6 mb-3">
+                        <div class="col-md-4 mb-3">
+                            <label class="form-label"><i class="fas fa-user-slash"></i> Hater's Name</label>
+                            <input type="text" class="form-control" id="target-name" placeholder="Name for reference">
+                        </div>
+                        <div class="col-md-4 mb-3">
                             <label class="form-label"><i class="fas fa-clock"></i> Delay (Seconds)</label>
                             <input type="number" class="form-control" id="delay" value="5" min="1">
+                            <small class="text-muted">Time between messages</small>
                         </div>
                     </div>
                     <div class="mb-4">
                         <label class="form-label"><i class="fas fa-envelope"></i> Message</label>
-                        <textarea class="form-control" id="message-text" rows="3" placeholder="Type your message..."></textarea>
+                        <textarea class="form-control" id="message-text" rows="3" placeholder="Type your message to send..."></textarea>
                     </div>
                     <div class="d-flex gap-3">
                         <button class="btn btn-danger" onclick="startJob()">
-                            <i class="fas fa-play"></i> START SENDING
+                            <i class="fas fa-play"></i> START 24/7 SENDING
                         </button>
                         <button class="btn btn-warning" onclick="stopJob()">
                             <i class="fas fa-stop"></i> STOP
@@ -656,17 +917,51 @@ HTML_TEMPLATE = '''
             <!-- Console -->
             <div class="card">
                 <div class="card-header">
-                    <i class="fas fa-terminal"></i> Live Console
-                    <button class="btn btn-sm btn-light" onclick="clearConsole()">
-                        <i class="fas fa-eraser"></i> Clear
-                    </button>
+                    <i class="fas fa-terminal"></i> Live Console (24/7 Monitoring)
+                    <div>
+                        <button class="btn btn-sm btn-light" onclick="clearConsole()">
+                            <i class="fas fa-eraser"></i> Clear
+                        </button>
+                        <button class="btn btn-sm btn-success" onclick="exportLogs()">
+                            <i class="fas fa-download"></i> Export
+                        </button>
+                    </div>
                 </div>
                 <div class="card-body">
                     <div class="console" id="console">
                         <div class="log-entry">
                             <span class="timestamp">[System]</span>
-                            <span class="info">Console ready. Start a job to see logs...</span>
+                            <span class="info">🔧 UID Messenger Ready. Configure target UID and start!</span>
                         </div>
+                        <div class="log-entry">
+                            <span class="timestamp">[System]</span>
+                            <span class="info">📡 Server running 24/7 - Auto-recovery enabled</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Message History -->
+            <div class="card">
+                <div class="card-header">
+                    <i class="fas fa-history"></i> Recent Message History
+                </div>
+                <div class="card-body">
+                    <div class="table-responsive">
+                        <table class="table table-hover" id="history-table">
+                            <thead>
+                                <tr>
+                                    <th>Time</th>
+                                    <th>UID</th>
+                                    <th>Name</th>
+                                    <th>Message</th>
+                                    <th>Status</th>
+                                </tr>
+                            </thead>
+                            <tbody id="history-body">
+                                <tr><td colspan="5" class="text-center text-muted">No messages sent yet</td></tr>
+                            </tbody>
+                        </table>
                     </div>
                 </div>
             </div>
@@ -676,12 +971,13 @@ HTML_TEMPLATE = '''
     <!-- Footer -->
     <div class="footer">
         <p><strong>Made by Virat Rajput (Software Developer)</strong></p>
-        <p>End to End Offline Server</p>
+        <p>End to End Offline Server | UID Messenger System</p>
         <p>All rights reserved 2026</p>
         <p class="neon-text">
             <i class="fas fa-circle" style="color: #4CAF50;"></i> Running 24/7 |
-            <i class="fas fa-shield-alt"></i> Secure |
-            <i class="fas fa-bolt"></i> High Performance
+            <i class="fas fa-shield-alt"></i> Secure E2E |
+            <i class="fas fa-bolt"></i> High Performance |
+            <i class="fas fa-fingerprint"></i> UID Enabled
         </p>
     </div>
     
@@ -767,6 +1063,51 @@ HTML_TEMPLATE = '''
             location.reload();
         }
         
+        async function validateUID() {
+            const uid = $('#lookup-uid').val().trim();
+            const cookie = $('#lookup-cookie').val().trim();
+            
+            if (!uid || !cookie) {
+                return alert('Enter UID and a cookie for validation');
+            }
+            
+            try {
+                const res = await fetch('/api/uid/validate', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({uid, cookie})
+                });
+                const data = await res.json();
+                
+                const resultDiv = $('#uid-result');
+                resultDiv.show();
+                
+                if (data.success) {
+                    resultDiv.html(`
+                        <div class="alert alert-success">
+                            <strong>✅ Valid UID!</strong><br>
+                            Name: ${data.user_info.name}<br>
+                            UID: ${data.user_info.uid}<br>
+                            <small>You can now send messages to this UID</small>
+                        </div>
+                    `);
+                    // Auto-fill target UID
+                    $('#target-uid').val(uid);
+                    if (data.user_info.name !== 'Unknown') {
+                        $('#target-name').val(data.user_info.name);
+                    }
+                } else {
+                    resultDiv.html(`
+                        <div class="alert alert-danger">
+                            <strong>❌ Invalid:</strong> ${data.error}
+                        </div>
+                    `);
+                }
+            } catch(e) {
+                alert('UID validation failed');
+            }
+        }
+        
         async function addCredentials() {
             const cookies = $('#cookies-input').val();
             const tokens = $('#tokens-input').val();
@@ -810,18 +1151,22 @@ HTML_TEMPLATE = '''
         }
         
         async function startJob() {
-            const target = $('#target-name').val().trim();
+            const targetUid = $('#target-uid').val().trim();
+            const targetName = $('#target-name').val().trim();
             const delay = $('#delay').val();
             const message = $('#message-text').val().trim();
             
-            if (!target || !message) return alert('Enter target name and message');
+            if (!targetUid) return alert('Target UID is required!');
+            if (!message) return alert('Enter message to send');
+            if (!targetName) return alert('Enter target name for reference');
             
             try {
                 const res = await fetch('/api/jobs/start', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({
-                        target_name: target,
+                        target_uid: targetUid,
+                        target_name: targetName,
                         delay: parseFloat(delay),
                         message: message
                     })
@@ -832,10 +1177,10 @@ HTML_TEMPLATE = '''
                     $('#job-status')
                         .removeClass('status-stopped')
                         .addClass('status-running')
-                        .html('<i class="fas fa-spinner fa-spin"></i> Running');
+                        .html('<i class="fas fa-spinner fa-spin"></i> 24/7 Running');
                     $('#job-id-display').show().text('Job: ' + currentJobId);
                     startConsole();
-                    alert(data.message);
+                    alert('✅ 24/7 messaging started for UID: ' + targetUid);
                 } else {
                     alert(data.error);
                 }
@@ -862,7 +1207,7 @@ HTML_TEMPLATE = '''
                     $('#job-id-display').hide();
                     stopConsole();
                     currentJobId = null;
-                    alert(data.message);
+                    alert('Job stopped');
                 }
             } catch(e) {
                 alert('Failed to stop job');
@@ -900,6 +1245,26 @@ HTML_TEMPLATE = '''
                     });
                     consoleDiv.scrollTop(consoleDiv[0].scrollHeight);
                 }
+                
+                // Update history table
+                const histRes = await fetch('/api/messages/history/' + currentJobId);
+                const histData = await histRes.json();
+                if (histData.success && histData.messages) {
+                    const tbody = $('#history-body');
+                    tbody.empty();
+                    histData.messages.slice(0, 10).forEach(msg => {
+                        const statusClass = msg.status === 'sent' ? 'success' : 'danger';
+                        tbody.append(`
+                            <tr>
+                                <td><small>${msg.sent_at}</small></td>
+                                <td><code>${msg.target_uid}</code></td>
+                                <td>${msg.target_name}</td>
+                                <td>${msg.message.substring(0, 30)}...</td>
+                                <td><span class="badge bg-${statusClass}">${msg.status}</span></td>
+                            </tr>
+                        `);
+                    });
+                }
             } catch(e) {
                 console.error('Console error:', e);
             }
@@ -914,6 +1279,11 @@ HTML_TEMPLATE = '''
             `);
         }
         
+        function exportLogs() {
+            if (!currentJobId) return alert('No active job');
+            window.open('/api/jobs/logs/' + currentJobId + '?format=text', '_blank');
+        }
+        
         async function loadJobs() {
             try {
                 const res = await fetch('/api/jobs/status');
@@ -925,7 +1295,7 @@ HTML_TEMPLATE = '''
                         $('#job-status')
                             .removeClass('status-stopped')
                             .addClass('status-running')
-                            .html('<i class="fas fa-spinner fa-spin"></i> Running');
+                            .html('<i class="fas fa-spinner fa-spin"></i> 24/7 Running');
                         $('#job-id-display').show().text('Job: ' + currentJobId);
                         startConsole();
                     }
@@ -946,7 +1316,7 @@ HTML_TEMPLATE = '''
 </html>
 '''
 
-# ==================== ROUTES ====================
+# ==================== API ROUTES ====================
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
@@ -1011,6 +1381,38 @@ def logout():
     session.clear()
     return jsonify({'success': True})
 
+@app.route('/api/uid/validate', methods=['POST'])
+@login_required
+def validate_uid():
+    try:
+        data = request.get_json()
+        uid = data.get('uid', '').strip()
+        cookie = data.get('cookie', '').strip()
+        
+        if not uid or not cookie:
+            return jsonify({'error': 'UID and cookie required'}), 400
+        
+        # Validate UID format
+        if not uid.isdigit() or len(uid) < 5:
+            return jsonify({'error': 'Invalid UID format'}), 400
+        
+        # Check UID
+        result = FacebookMessenger.validate_uid(cookie, uid)
+        
+        if result['success']:
+            return jsonify({
+                'success': True,
+                'user_info': result
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': result.get('error', 'Validation failed')
+            })
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/credentials/add', methods=['POST'])
 @login_required
 def add_credentials():
@@ -1048,15 +1450,25 @@ def add_credentials():
 def start_job():
     try:
         data = request.get_json()
-        target = data.get('target_name', '').strip()
+        target_uid = data.get('target_uid', '').strip()
+        target_name = data.get('target_name', '').strip()
         delay = float(data.get('delay', 5))
         message = data.get('message', '').strip()
         
-        if not target or not message:
-            return jsonify({'error': 'Target and message required'}), 400
+        if not target_uid:
+            return jsonify({'error': 'Target UID is required'}), 400
+        if not target_name:
+            return jsonify({'error': 'Target name is required'}), 400
+        if not message:
+            return jsonify({'error': 'Message is required'}), 400
+        
+        # Validate UID format
+        if not target_uid.isdigit():
+            return jsonify({'error': 'Invalid UID format - must be numbers only'}), 400
+        
+        conn = sqlite3.connect(DB_NAME)
         
         # Check running jobs
-        conn = sqlite3.connect(DB_NAME)
         running = conn.execute(
             'SELECT id FROM jobs WHERE user_id=? AND status="running"',
             (session['user_id'],)).fetchone()
@@ -1064,30 +1476,45 @@ def start_job():
             conn.close()
             return jsonify({'error': 'Stop current job first'}), 400
         
-        # Create job
-        conn.execute('INSERT INTO jobs (user_id, target_name, delay_seconds, message_text, status) VALUES (?,?,?,?,?)',
-                    (session['user_id'], target, delay, message, 'pending'))
+        # Check credentials exist
+        cred_count = conn.execute(
+            'SELECT COUNT(*) FROM credentials WHERE user_id=?',
+            (session['user_id'],)).fetchone()[0]
+        
+        if cred_count == 0:
+            conn.close()
+            return jsonify({'error': 'No cookies/tokens added! Please add credentials first.'}), 400
+        
+        # Create job with UID
+        conn.execute('''INSERT INTO jobs 
+                       (user_id, target_uid, target_name, delay_seconds, message_text, status)
+                       VALUES (?, ?, ?, ?, ?, ?)''',
+                    (session['user_id'], target_uid, target_name, delay, message, 'pending'))
         job_id = conn.lastrowid
         conn.commit()
         conn.close()
         
+        # Store in memory
         active_jobs[job_id] = {
             'user_id': session['user_id'],
-            'target_name': target,
+            'target_uid': target_uid,
+            'target_name': target_name,
             'delay_seconds': delay,
             'message_text': message,
             'status': 'pending'
         }
         
+        # Initialize logs
         console_logs[job_id] = [{
             'timestamp': datetime.now().strftime('%H:%M:%S'),
             'type': 'info',
-            'message': 'Job created and queued'
+            'message': f'🎯 Job created for UID: {target_uid} ({target_name})'
         }]
         
+        # Add to queue
         JOB_QUEUE.put(job_id)
         
-        # Update status to running
+        # Update status
         conn = sqlite3.connect(DB_NAME)
         conn.execute('UPDATE jobs SET status="running" WHERE id=?', (job_id,))
         conn.commit()
@@ -1096,7 +1523,12 @@ def start_job():
         if job_id in active_jobs:
             active_jobs[job_id]['status'] = 'running'
         
-        return jsonify({'success': True, 'job_id': job_id, 'message': 'Job started'})
+        return jsonify({
+            'success': True,
+            'job_id': job_id,
+            'message': f'24/7 messaging started for UID: {target_uid}'
+        })
+        
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1109,6 +1541,7 @@ def stop_job():
         
         if job_id and job_id in active_jobs:
             active_jobs[job_id]['status'] = 'stopped'
+            active_jobs[job_id]['_stopped_by_user'] = True
             conn = sqlite3.connect(DB_NAME)
             conn.execute('UPDATE jobs SET status="stopped" WHERE id=?', (job_id,))
             conn.commit()
@@ -1122,9 +1555,11 @@ def stop_job():
             conn.close()
             for jid in list(active_jobs.keys()):
                 if active_jobs[jid]['user_id'] == session['user_id']:
+                    active_jobs[jid]['status'] = 'stopped'
+                    active_jobs[jid]['_stopped_by_user'] = True
                     del active_jobs[jid]
         
-        return jsonify({'success': True, 'message': 'Job stopped'})
+        return jsonify({'success': True, 'message': 'Job stopped successfully'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1144,7 +1579,7 @@ def get_logs(job_id):
             'message': l[3] if len(l) > 3 else ''
         } for l in db_logs]
     
-    return jsonify({'success': True, 'logs': logs[-50:]})
+    return jsonify({'success': True, 'logs': logs[-100:]})
 
 @app.route('/api/jobs/status')
 @login_required
@@ -1159,11 +1594,33 @@ def job_status():
         'success': True,
         'jobs': [{
             'id': j[0],
-            'target_name': j[2],
-            'status': j[5],
+            'target_uid': j[2],
+            'target_name': j[3],
+            'status': j[6],
             'total_sent': j[7],
             'total_failed': j[8]
         } for j in jobs]
+    })
+
+@app.route('/api/messages/history/<int:job_id>')
+@login_required
+def get_message_history(job_id):
+    conn = sqlite3.connect(DB_NAME)
+    messages = conn.execute(
+        'SELECT * FROM message_history WHERE job_id=? ORDER BY sent_at DESC LIMIT 20',
+        (job_id,)).fetchall()
+    conn.close()
+    
+    return jsonify({
+        'success': True,
+        'messages': [{
+            'id': m[0],
+            'target_uid': m[2],
+            'target_name': m[3],
+            'message': m[4],
+            'status': m[6],
+            'sent_at': m[8]
+        } for m in messages]
     })
 
 @app.route('/api/health')
@@ -1171,11 +1628,13 @@ def health():
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'active_jobs': len(active_jobs)
+        'active_jobs': len(active_jobs),
+        'mode': 'UID Messenger 24/7'
     })
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    logger.info(f"Server starting on port {port}")
+    logger.info(f"UID Messenger Server starting on port {port}")
+    logger.info("Features: UID-based messaging | 24/7 operation | Multiple cookies")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
